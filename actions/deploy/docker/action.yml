@@ -1,0 +1,104 @@
+name: Deploy Docker Image
+description: Pull Docker image on remote machine
+
+inputs:
+  IMAGE_TAG:
+    description: 'Docker image tag'
+    required: true
+  HOST_PORT:
+    description: 'Application port'
+    required: true
+  DOCKER_CONTAINER_PORT:
+    description: 'Docker container port'
+    required: true
+  VAULT_SERVER:
+    description: 'Vault server URL'
+    required: true
+  VAULT_TOKEN:
+    description: 'Vault token for authentication'
+    required: true
+  VAULT_SECRETS_CICD_PATH:
+    description: 'Vault path for CICD sercrets'
+    required: true
+  VAULT_SECRETS_PATH:
+    description: 'Vault path for app sercrets'
+    required: true
+  ENVIRONMENT:
+    description: 'Deployment environment name'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Import Secrets From Vault
+      uses: hashicorp/vault-action@v2
+      with:
+        url: https://${{ inputs.VAULT_SERVER }}/
+        token: ${{ inputs.VAULT_TOKEN }}
+        tlsSkipVerify: true
+        secrets: |
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_USER | CR_USER;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_PASSWORD | CR_PASSWORD;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY | IMAGE_REPOSITORY;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY_TYPE | IMAGE_REPOSITORY_TYPE;
+          ${{ inputs.VAULT_SECRETS_PATH }} REMOTE_HOST | REMOTE_HOST;
+          ${{ inputs.VAULT_SECRETS_PATH }} REMOTE_USER | REMOTE_USER;
+          ${{ inputs.VAULT_SECRETS_PATH }} SSH_PRIVATE_KEY | SSH_PRIVATE_KEY;
+          ${{ inputs.VAULT_SECRETS_PATH }} PROJECT_DIR | PROJECT_DIR;
+
+    - name: Ensure .ssh Directory Exists
+      run: |
+        mkdir -p ~/.ssh
+        touch ~/.ssh/known_hosts
+      shell: bash
+
+    - name: Adding Known Hosts
+      run: ssh-keyscan -H ${{ env.REMOTE_HOST }} >> ~/.ssh/known_hosts
+      shell: bash
+
+    - name: Install SSH Key
+      uses: shimataro/ssh-key-action@v2
+      with:
+        key: ${{ env.SSH_PRIVATE_KEY }}
+        if_key_exists: replace
+        known_hosts: ${{ env.REMOTE_HOST }}
+
+    - name: Ensure Project Directory Exists on Server
+      run: |
+        if [ -n "${{ env.PROJECT_DIR }}" ]; then
+          ssh ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }} "sudo mkdir -p ${{ env.PROJECT_DIR }} && sudo chown -R ${{ env.REMOTE_USER }}:${{ env.REMOTE_USER }} ${{ env.PROJECT_DIR }}"
+        else
+          echo "PROJECT_DIR not supplied, skipping directory creation."
+        fi
+      shell: bash
+
+    - name: Deploy Docker Image on Remote
+      run: |
+        ssh ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }} << EOF
+          set -e
+
+          if [ -n "${{ env.PROJECT_DIR }}" ]; then
+            echo "Ensuring project directory exists at ${{ env.PROJECT_DIR }}..."
+            sudo mkdir -p "${{ env.PROJECT_DIR }}"
+            sudo chown -R "${{ env.REMOTE_USER }}:${{ env.REMOTE_USER }}" "${{ env.PROJECT_DIR }}"
+          else
+            echo "PROJECT_DIR not supplied, skipping directory creation."
+          fi
+
+          echo "${{ env.CR_PASSWORD }}" | docker login -u "${{ env.CR_USER }}" --password-stdin "${{ env.IMAGE_REPOSITORY }}"
+
+          FULL_IMAGE="${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}:${{ inputs.IMAGE_TAG }}"
+          echo "Pulling image: \$FULL_IMAGE"
+          docker pull "\$FULL_IMAGE"
+
+          container_ids=\$(docker ps -q)
+          if [ -n "\$container_ids" ]; then
+            echo 'Stopping and removing existing containers...'
+            docker stop \$container_ids && docker rm \$container_ids
+          fi
+
+          echo "Starting container from image..."
+          docker run -d -p ${{ inputs.HOST_PORT }}:${{ inputs.DOCKER_CONTAINER_PORT }} "\$FULL_IMAGE"
+        EOF
+      shell: bash
+

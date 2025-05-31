@@ -1,0 +1,69 @@
+  name: Example K8s Deployment
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+env:
+  VAULT_SECRETS_CICD_PATH: "/path/to/cicd/secrets"
+  VAULT_SECRETS_PATH: "/path/to/app/secrets"
+  ENVIRONMENT: "development"
+  PROJECT_NAME: example-projects
+
+jobs:
+  build:
+    runs-on: [self-hosted, devrunner2]
+    steps:
+      - name: Checkout Repository 
+        uses: actions/checkout@v3
+
+      - name: Build and Push Docker Image
+        uses: ../actions/build/docker/dotnet@main
+        with:
+          VAULT_SERVER: ${{ secrets.VAULT_SERVER }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          VAULT_SECRETS_CICD_PATH: ${{ env.VAULT_SECRETS_CICD_PATH }}
+          VAULT_SECRETS_PATH: ${{ env.VAULT_SECRETS_PATH }}
+          DOCKERFILE: Dockerfile
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+          BUILD_CONTEXT: .
+          IMAGE_TAG: ${{ github.sha }}
+          BUILD_ARGS: "--build-arg PROJECT_NAME=${{ env.PROJECT_NAME }} --build-arg ENVIRONMENT=${{ env.ENVIRONMENT }}"
+
+  deploy:
+    runs-on: [self-hosted, devrunner2]
+    needs: build
+    steps:
+      - name: Deploy to Kubernetes
+        uses: ../actions/deploy/k8s/dotnet@main
+        with:
+          VAULT_SERVER: ${{ secrets.VAULT_SERVER }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          VAULT_SECRETS_PATH: ${{ env.VAULT_SECRETS_PATH }}
+          VAULT_SECRETS_CICD_PATH: ${{ env.VAULT_SECRETS_CICD_PATH }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }} 
+          IMAGE_TAG: ${{ github.sha }}
+          ISTIO: true
+          REPLICAS: 1
+          EXTRA_HELM_ARGS_1: ""
+          EXTRA_HELM_ARGS_2: ""
+          EXTRA_HELM_ARGS_3: ""
+
+  notify:
+    needs: [build, deploy]
+    runs-on: [self-hosted, devrunner2]
+    if: always()
+    steps:
+      - name: Send Slack Notification
+        uses: ../actions/notify/slack@main
+        with:
+          BUILD_RESULT: ${{ needs.build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          PROJECT_NAME: ${{ env.PROJECT_NAME }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+          VAULT_SECRETS_CICD_PATH: ${{ env.VAULT_SECRETS_CICD_PATH }}
+          mention_users: "SLACK_USER_ID_1, SLACK_USER_ID_2"
+          VAULT_SERVER: ${{ secrets.VAULT_SERVER }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}

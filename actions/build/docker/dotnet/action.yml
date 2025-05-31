@@ -1,0 +1,120 @@
+name: Backend Dotnet Build
+description: Build and push Docker image 
+
+inputs:
+  DOCKERFILE:
+    description: Path to Dockerfile
+    required: true
+    default: 'Dockerfile'
+  BUILD_CONTEXT:
+    description: Docker build context path
+    required: true
+    default: '.'
+  ENVIRONMENT:
+    description: Build environment (dev/staging/prod)
+    required: true
+    default: 'dev'
+  IMAGE_TAG:
+    description: Docker image tag
+    required: true
+  VAULT_SERVER:
+    description: Vault server URL
+    required: true
+  VAULT_TOKEN:
+    description: Vault token for authentication
+    required: true
+  VAULT_SECRETS_CICD_PATH:
+    description: Vault path for CICD secrets
+    required: true
+  VAULT_SECRETS_PATH:
+    description: Vault path for app secrets
+    required: true
+  BUILD_ARGS:
+    description: Additional Docker build arguments
+    required: false
+  PROJECT_NAME:
+    description: Project name
+    required: true
+  PUSH_LATEST:
+    description: Whether to push latest tag
+    required: false
+    default: 'true'
+
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Inputs
+      run: |
+        # Validate environment
+        if [[ ! "${{ inputs.ENVIRONMENT }}" =~ ^(development|uat|staging|production)$ ]]; then
+          echo "::error::Invalid environment: ${{ inputs.ENVIRONMENT }}. Must be one of: development, uat, staging, production"
+          exit 1
+        fi
+        
+        
+        # Validate Dockerfile exists
+        if [ ! -f "${{ inputs.BUILD_CONTEXT }}/${{ inputs.DOCKERFILE }}" ]; then
+          echo "::error::Dockerfile not found at ${{ inputs.BUILD_CONTEXT }}/${{ inputs.DOCKERFILE }}"
+          exit 1
+        fi
+      shell: bash
+
+    - name: Import Secrets From Vault
+      uses: hashicorp/vault-action@v2
+      with:
+        url: https://${{ inputs.VAULT_SERVER }}/
+        token: ${{ inputs.VAULT_TOKEN }}
+        tlsSkipVerify: true
+        secrets: |
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_USER | CR_USER;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_PASSWORD | CR_PASSWORD;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY | IMAGE_REPOSITORY;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY_TYPE | IMAGE_REPOSITORY_TYPE;
+
+    - name: Login to Container Registry
+      run: |
+        echo "${{ env.CR_PASSWORD }}" | docker login -u "${{ env.CR_USER }}" --password-stdin "${{ env.IMAGE_REPOSITORY }}"
+      shell: bash
+
+    - name: Build and Push Docker Image
+      run: |
+        # Set image name variables
+        IMAGE_NAME="${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}"
+        IMAGE_TAG="${{ inputs.IMAGE_TAG }}"
+        
+        # Prepare build arguments
+        BUILD_ARGS=""
+        if [ -n "${{ inputs.BUILD_ARGS }}" ]; then
+          BUILD_ARGS="${{ inputs.BUILD_ARGS }}"
+        fi
+        
+        # Build the image
+        echo "Building image: $IMAGE_NAME:$IMAGE_TAG"
+        docker build \
+          --tag "$IMAGE_NAME:$IMAGE_TAG" \
+          --file "${{ inputs.DOCKERFILE }}" \
+          $BUILD_ARGS \
+          "${{ inputs.BUILD_CONTEXT }}"
+        
+        # Push the image
+        echo "Pushing image: $IMAGE_NAME:$IMAGE_TAG"
+        docker push "$IMAGE_NAME:$IMAGE_TAG"
+        
+        # Push latest tag if enabled
+        if [ "${{ inputs.PUSH_LATEST }}" = "true" ]; then
+          echo "Tagging and pushing latest..."
+          docker tag "$IMAGE_NAME:$IMAGE_TAG" "$IMAGE_NAME:latest"
+          docker push "$IMAGE_NAME:latest"
+        fi
+      shell: bash
+
+    - name: Cleanup
+      if: always()
+      run: |
+        # Logout from container registry
+        docker logout "${{ env.IMAGE_REPOSITORY }}" || true
+        
+        # Cleanup Docker credentials
+        rm -rf ~/.docker/config.json || true
+      shell: bash
