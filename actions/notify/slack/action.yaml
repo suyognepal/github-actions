@@ -1,0 +1,236 @@
+name: "Slack Notification"
+description: "Send customizable workflow notifications to Slack with enhanced reliability and formatting"
+author: "Suyog Nepal"
+
+inputs:
+  PROJECT_NAME:
+    description: "Project Name"
+    required: true
+  ENVIRONMENT:
+    description: "Build Environment (e.g., prod, dev)"
+    required: true
+  BUILD_RESULT:
+    description: "Result of the build job"
+    required: true
+  DEPLOY_RESULT:
+    description: "Result of the deploy job"
+    required: true
+  notification_title:
+    description: "Notification title"
+    required: false
+    default: ":robot_face: *Deployment Status*"
+  message_format:
+    description: "Specify notification message format"
+    required: false
+    default: "{emoji} *{workflow}* {status_message} in <{repo_url}|{repo}@{branch}> on <{commit_url}|{commit_sha}>"
+  footer:
+    description: "Footer text"
+    required: false
+    default: |
+      *Commit Message:* ${{ github.event.head_commit.message }}
+      *Author:* ${{ github.event.head_commit.author.name }}
+      *Date:* ${{ github.event.head_commit.author.date }}
+  notify_when:
+    description: "Specify on which events a Slack notification is sent (comma-separated: success,failure,cancelled,warnings,skipped)"
+    required: false
+    default: "success,failure,cancelled,warnings,skipped"
+  mention_users:
+    description: "User/group to mention (@user, @here, @channel)"
+    required: false
+    default: ""
+  mention_users_when:
+    description: "Specify on which events to mention users (comma-separated: success,failure,cancelled,warnings,skipped)"
+    required: false
+    default: "success,failure,cancelled,warnings,skipped"
+  icon_success:
+    description: "Icon for success"
+    required: false
+    default: ":heavy_check_mark:"
+  icon_failure:
+    description: "Icon for failure"
+    required: false
+    default: ":x:"
+  VAULT_SECRETS_CICD_PATH:
+    description: "Vault path for CI/CD secrets"
+    required: true
+  VAULT_SERVER:
+    description: "Vault server URL"
+    required: true
+  VAULT_TOKEN:
+    description: "Vault token for authentication"
+    required: true
+  RETRY_COUNT:
+    description: "Number of retries for failed operations"
+    required: false
+    default: "3"
+  RETRY_DELAY:
+    description: "Delay between retries in seconds"
+    required: false
+    default: "5"
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Inputs
+      shell: bash
+      run: |
+        # Validate environment
+        if [[ ! "${{ inputs.ENVIRONMENT }}" =~ ^(development|uat|staging|production)$ ]]; then
+          echo "::error::Invalid environment: ${{ inputs.ENVIRONMENT }}. Must be one of: development, uat, staging, production"
+          exit 1
+        fi
+        
+        # Validate build and deploy results
+        valid_results="success failure cancelled warnings skipped"
+        if ! echo "$valid_results" | grep -q -w "${{ inputs.BUILD_RESULT }}"; then
+          echo "::error::Invalid build result: ${{ inputs.BUILD_RESULT }}"
+          exit 1
+        fi
+        if ! echo "$valid_results" | grep -q -w "${{ inputs.DEPLOY_RESULT }}"; then
+          echo "::error::Invalid deploy result: ${{ inputs.DEPLOY_RESULT }}"
+          exit 1
+        fi
+        
+        # Validate retry parameters
+        if ! [[ "${{ inputs.RETRY_COUNT }}" =~ ^[0-9]+$ ]] || [ "${{ inputs.RETRY_COUNT }}" -lt 1 ]; then
+          echo "::error::Invalid retry count: ${{ inputs.RETRY_COUNT }}. Must be a positive integer"
+          exit 1
+        fi
+        if ! [[ "${{ inputs.RETRY_DELAY }}" =~ ^[0-9]+$ ]] || [ "${{ inputs.RETRY_DELAY }}" -lt 1 ]; then
+          echo "::error::Invalid retry delay: ${{ inputs.RETRY_DELAY }}. Must be a positive integer"
+          exit 1
+        fi
+
+    - name: Import Secrets From Vault
+      id: vault
+      uses: hashicorp/vault-action@v2
+      with:
+        url: https://${{ inputs.VAULT_SERVER }}/
+        token: ${{ inputs.VAULT_TOKEN }}
+        tlsSkipVerify: true
+        exportEnv: true
+        secrets: |
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} SLACK_WEBHOOK_URL | SLACK_WEBHOOK_URL;
+
+    - name: Verify Slack Webhook
+      shell: bash
+      run: |
+        # Function to verify webhook with retries
+        verify_webhook() {
+          local retries=${{ inputs.RETRY_COUNT }}
+          local delay=${{ inputs.RETRY_DELAY }}
+          
+          while [ $retries -gt 0 ]; do
+            if [ -n "$SLACK_WEBHOOK_URL" ]; then
+              echo "Slack webhook URL verified"
+              return 0
+            fi
+            
+            echo "Webhook verification failed. Retrying in $delay seconds..."
+            sleep $delay
+            retries=$((retries - 1))
+          done
+          
+          echo "::error::Slack webhook URL not found in Vault after ${{ inputs.RETRY_COUNT }} attempts"
+          return 1
+        }
+        
+        verify_webhook
+
+    - name: Determine Final Status
+      id: status
+      shell: bash
+      run: |
+        # Function to determine status with proper error handling
+        determine_status() {
+          local build_result="${{ inputs.BUILD_RESULT }}"
+          local deploy_result="${{ inputs.DEPLOY_RESULT }}"
+          
+          case "$build_result" in
+            "failure")
+              echo "FINAL_STATUS=failure" >> $GITHUB_ENV
+              echo "EMOJI=:x:" >> $GITHUB_ENV
+              ;;
+            "skipped")
+              echo "FINAL_STATUS=skipped" >> $GITHUB_ENV
+              echo "EMOJI=:double_vertical_bar:" >> $GITHUB_ENV
+              ;;
+            *)
+              case "$deploy_result" in
+                "failure")
+                  echo "FINAL_STATUS=failure" >> $GITHUB_ENV
+                  echo "EMOJI=:x:" >> $GITHUB_ENV
+                  ;;
+                "cancelled")
+                  echo "FINAL_STATUS=cancelled" >> $GITHUB_ENV
+                  echo "EMOJI=:warning:" >> $GITHUB_ENV
+                  ;;
+                "success")
+                  echo "FINAL_STATUS=success" >> $GITHUB_ENV
+                  echo "EMOJI=:white_check_mark:" >> $GITHUB_ENV
+                  ;;
+                *)
+                  echo "FINAL_STATUS=unknown" >> $GITHUB_ENV
+                  echo "EMOJI=:grey_question:" >> $GITHUB_ENV
+                  ;;
+              esac
+              ;;
+          esac
+          
+          echo "status=$FINAL_STATUS" >> $GITHUB_OUTPUT
+        }
+        
+        determine_status
+
+    - name: Prepare Notification Message
+      shell: bash
+      run: |
+        # Function to escape special characters
+        escape_special_chars() {
+          echo "$1" | sed 's/[&]/\\&/g'
+        }
+        
+        # Prepare message with proper escaping
+        MESSAGE=$(echo "${{ inputs.message_format }}" | \
+          sed "s#{emoji}#$(escape_special_chars "${{ env.EMOJI }}")#g" | \
+          sed "s#{workflow}#$(escape_special_chars "${{ inputs.PROJECT_NAME }} (${{ inputs.ENVIRONMENT }})")#g" | \
+          sed "s#{status_message}#$(escape_special_chars "${{ env.FINAL_STATUS }}")#g" | \
+          sed "s#{repo}#$(escape_special_chars "${{ github.repository }}")#g" | \
+          sed "s#{branch}#$(escape_special_chars "${{ github.ref_name }}")#g" | \
+          sed "s#{repo_url}#https://github.com/${{ github.repository }}/tree/${{ github.ref_name }}#g" | \
+          sed "s#{commit_sha}#${GITHUB_SHA:0:7}#g" | \
+          sed "s#{commit_url}#https://github.com/${{ github.repository }}/commit/${{ github.sha }}#g")
+        
+        # Add additional context if available
+        if [ -n "${{ github.event.head_commit.message }}" ]; then
+          MESSAGE="$MESSAGE\n*Commit:* $(escape_special_chars "${{ github.event.head_commit.message }}")"
+        fi
+        
+        echo "MESSAGE=$MESSAGE" >> $GITHUB_ENV
+
+    - name: Send Slack Notification
+      id: slack
+      uses: ravsamhq/notify-slack-action@v2
+      if: contains('${{ inputs.notify_when }}', env.FINAL_STATUS)
+      with:
+        status: ${{ env.FINAL_STATUS }}
+        notification_title: "${{ inputs.notification_title }}"
+        message: "${{ env.MESSAGE }}"
+        footer: "${{ inputs.footer }}"
+        mention_users: "${{ inputs.mention_users }}"
+        mention_users_when: "${{ inputs.mention_users_when }}"
+        icon_success: "${{ inputs.icon_success }}"
+        icon_failure: "${{ inputs.icon_failure }}"
+      env:
+        SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+      continue-on-error: true
+
+    - name: Verify Notification
+      if: always()
+      shell: bash
+      run: |
+        if [ "${{ steps.slack.outcome }}" != "success" ]; then
+          echo "::warning::Failed to send Slack notification. Please check the webhook URL and permissions."
+        else
+          echo "Slack notification sent successfully"
+        fi

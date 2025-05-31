@@ -1,0 +1,81 @@
+name: Frontend Build
+description: Frontend Build
+
+inputs:
+  DOCKERFILE:
+    description: Dockerfile
+    required: true
+    default: Dockerfile
+  BUILD_CONTEXT:
+    description: Docker build Context
+    required: true
+    default: '.'
+  ENVIRONMENT:
+    description: Build Environment
+    required: true
+  IMAGE_TAG:
+    description: Image Tag
+    required: true
+  VAULT_SERVER:
+    description: Vault server URL
+    required: true
+  VAULT_TOKEN:
+    description: Vault token for authentication
+    required: true
+  VAULT_SECRETS_CICD_PATH:
+    description: Vault path for CICD secrets
+    required: true
+  VAULT_SECRETS_PATH:
+    description: Vault path for app secrets
+    required: true
+  BUILD_ARGS:
+    description: Build args
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Import Secrets From Vault
+      uses: hashicorp/vault-action@v2
+      with:
+        url: https://${{ inputs.VAULT_SERVER }}/
+        token: ${{ inputs.VAULT_TOKEN }}
+        tlsSkipVerify: true
+        secrets: |
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_USER | CR_USER;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_PASSWORD | CR_PASSWORD;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY | IMAGE_REPOSITORY;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY_TYPE | IMAGE_REPOSITORY_TYPE;
+          ${{ inputs.VAULT_SECRETS_PATH }} NEXT_PUBLIC_API_BASE_URL | NEXT_PUBLIC_API_BASE_URL;
+          ${{ inputs.VAULT_SECRETS_PATH }} SESSION_SECRET | SESSION_SECRET;
+          ${{ inputs.VAULT_SECRETS_PATH }} API_BASE_URL | API_BASE_URL;
+          ${{ inputs.VAULT_SECRETS_PATH }} INTERNAL_RSA_PUBLIC_KEY | INTERNAL_RSA_PUBLIC_KEY;
+          ${{ inputs.VAULT_SECRETS_PATH }} HMAC_SECRET_KEY | HMAC_SECRET_KEY;
+
+    - name: Login to Container Registry
+      run: |
+        echo "${{ env.CR_PASSWORD }}" | docker login -u "${{ env.CR_USER }}" --password-stdin "${{ env.IMAGE_REPOSITORY }}"
+      shell: bash
+
+    - name: Write Secrets to .env File
+      run: |
+        echo 'NEXT_PUBLIC_API_BASE_URL="${{ env.NEXT_PUBLIC_API_BASE_URL }}"' > .env
+        echo 'SESSION_SECRET="${{ env.SESSION_SECRET }}"' >> .env
+        echo 'API_BASE_URL="${{ env.API_BASE_URL }}"' >> .env
+        echo 'INTERNAL_RSA_PUBLIC_KEY="${{ env.INTERNAL_RSA_PUBLIC_KEY }}"' >> .env
+        echo 'HMAC_SECRET_KEY="${{ env.HMAC_SECRET_KEY }}"' >> .env
+      shell: bash
+
+    - name: Build and Push Docker Image
+      run: |
+        docker build ${{ inputs.BUILD_CONTEXT }} \
+          --file ${{ inputs.DOCKERFILE }} \
+          --tag ${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}:${{ inputs.IMAGE_TAG }}
+
+        docker push ${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}:${{ inputs.IMAGE_TAG }}
+
+        docker tag ${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}:${{ inputs.IMAGE_TAG }} \
+          ${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}:latest
+
+        echo "✅ Pushed image: ${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}:${{ inputs.IMAGE_TAG }}"
+      shell: bash

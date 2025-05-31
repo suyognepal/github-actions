@@ -1,0 +1,108 @@
+name: VM Docker Deployment Rsync
+description: Deploy Application Node using Vault secrets
+
+inputs:
+  VAULT_SERVER:
+    description: "Vault server URL"
+    required: true
+  VAULT_TOKEN:
+    description: "Vault token for authentication"
+    required: true
+  VAULT_SECRETS_CICD_PATH:
+    description: "Vault path for CI/CD secrets"
+    required: true
+  VAULT_SECRETS_PATH:
+    description: "Vault path for deployment secrets"
+    required: true
+  CHECKOUT_SUBMODULES:
+    description: 'Whether to checkout submodules'
+    required: false
+    default: 'false'
+  ENCRYPTION:
+    description: 'Encrypted private key'
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Import Base Secrets From Vault
+      uses: hashicorp/vault-action@v2
+      with:
+        url: https://${{ inputs.VAULT_SERVER }}/
+        token: ${{ inputs.VAULT_TOKEN }}
+        tlsSkipVerify: true
+        secrets: |
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_USER | CR_USER ;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_PASSWORD | CR_PASSWORD ;
+          ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY | IMAGE_REPOSITORY ;
+          ${{ inputs.VAULT_SECRETS_PATH }} REMOTE_HOST | SERVER ;
+          ${{ inputs.VAULT_SECRETS_PATH }} REMOTE_USER | SSH_USER ;
+          ${{ inputs.VAULT_SECRETS_PATH }} SSH_KEY | SSH_PRIVATE_KEY ;
+          ${{ inputs.VAULT_SECRETS_PATH }} PROJECT_DIR | PROJECT_DIR ;
+          ${{ inputs.VAULT_SECRETS_PATH }} APP_SETTINGS | APP_SETTINGS ;
+
+    - name: Import Encryption Secrets From Vault (Conditional)
+      if: inputs.ENCRYPTION == 'true'
+      uses: hashicorp/vault-action@v2
+      with:
+        url: https://${{ inputs.VAULT_SERVER }}/
+        token: ${{ inputs.VAULT_TOKEN }}
+        tlsSkipVerify: true
+        secrets: |
+          ${{ inputs.VAULT_SECRETS_PATH }} RSA_PRIVATE_KEY | RSA_PRIVATE_KEY ;
+          ${{ inputs.VAULT_SECRETS_PATH }} RSA_PUBLIC_KEY | RSA_PUBLIC_KEY ;
+
+    - name: Ensure .ssh Directory Exists
+      run: |
+        mkdir -p ~/.ssh
+        touch ~/.ssh/known_hosts
+      shell: bash
+
+    - name: Adding Known Hosts
+      run: ssh-keyscan -H ${{ env.SERVER }} >> ~/.ssh/known_hosts
+      shell: bash
+
+    - name: Install SSH Key
+      uses: shimataro/ssh-key-action@v2
+      with:
+        key: ${{ env.SSH_PRIVATE_KEY }}
+        if_key_exists: replace
+        known_hosts: ${{ env.SERVER }}
+
+    - name: Create app_settings.json from Vault secret
+      run: |
+        echo '${{ env.APP_SETTINGS }}' > app_settings.json
+        jq empty app_settings.json || (echo "Invalid JSON in APP_SETTINGS" && exit 1)
+      shell: bash
+
+    - name: Create rsa_private.key from Vault (if encryption enabled)
+      if: inputs.ENCRYPTION == 'true'
+      run: echo '${{ env.RSA_PRIVATE_KEY }}' > rsa_private.key
+      shell: bash
+
+    - name: Create rsa_public.key from Vault (if encryption enabled)
+      if: inputs.ENCRYPTION == 'true'
+      run: echo '${{ env.RSA_PUBLIC_KEY }}' > rsa_public.key
+      shell: bash
+
+    - name: Ensure Project Directory Exists on Server
+      run: ssh ${{ env.SSH_USER }}@${{ env.SERVER }} "sudo mkdir -p ${{ env.PROJECT_DIR }} && sudo chown -R ${{ env.SSH_USER }}:${{ env.SSH_USER }} ${{ env.PROJECT_DIR }}"
+      shell: bash
+
+    - name: Deploy latest version to server
+      run: |
+        rsync -avzP --delete --exclude ".git" --exclude ".gitignore" ./ ${{ env.SSH_USER }}@${{ env.SERVER }}:${{ env.PROJECT_DIR }}/
+      shell: bash
+
+    - name: Docker Compose Down
+      run: ssh ${{ env.SSH_USER }}@${{ env.SERVER }} "cd ${{ env.PROJECT_DIR }} && sudo docker compose down -v"
+      shell: bash
+
+    - name: Docker Compose Build
+      run: ssh ${{ env.SSH_USER }}@${{ env.SERVER }} "cd ${{ env.PROJECT_DIR }} && sudo docker compose build"
+      shell: bash
+
+    - name: Docker Compose Up
+      run: ssh ${{ env.SSH_USER }}@${{ env.SERVER }} "cd ${{ env.PROJECT_DIR }} && sudo docker compose up -d"
+      shell: bash

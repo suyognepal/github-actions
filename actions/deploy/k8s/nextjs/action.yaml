@@ -1,0 +1,234 @@
+name: Kubernetes Deployment
+description: Deploy Helm chart to Kubernetes with enhanced security and reliability
+inputs:
+  VAULT_SERVER:
+    description: Vault server URL
+    required: true
+  VAULT_TOKEN: 
+    description: Vault authentication token
+    required: true
+  VAULT_SECRETS_PATH:
+    description: Path to application secrets in Vault
+    required: true
+  VAULT_SECRETS_CICD_PATH:
+    description: Path to CI/CD secrets in Vault
+    required: true
+  IMAGE_TAG:
+    description: Docker image tag to deploy
+    required: true
+  ISTIO:
+    description: Enable Istio sidecar injection
+    required: true
+    default: 'false'
+  GITHUB_PAT:
+    description: GitHub Personal Access Token
+    required: true
+  ENVIRONMENT:
+    description: Deployment environment (dev/staging/prod)
+    required: true
+    default: 'dev'
+  REPLICAS:
+    description: Number of pod replicas
+    required: true
+    default: '1'
+  EXTRA_HELM_ARGS_1:
+    description: Additional Helm arguments (optional)
+    required: false
+  EXTRA_HELM_ARGS_2:
+    description: Additional Helm arguments (optional)
+    required: false
+  EXTRA_HELM_ARGS_3:
+    description: Additional Helm arguments (optional)
+    required: false
+  TIMEOUT:
+    description: Deployment timeout in seconds
+    required: false
+    default: '300'
+  RETRY_COUNT:
+    description: Number of retries for failed operations
+    required: false
+    default: '3'
+  RETRY_DELAY:
+    description: Delay between retries in seconds
+    required: false
+    default: '5'
+
+runs:
+  using: composite
+  steps:
+  - name: Validate Inputs
+    run: |
+      # Validate environment
+        if [[ ! "${{ inputs.ENVIRONMENT }}" =~ ^(development|uat|staging|production)$ ]]; then
+          echo "::error::Invalid environment: ${{ inputs.ENVIRONMENT }}. Must be one of: development, uat, staging, production"
+        exit 1
+      fi
+      
+      # Validate timeout
+      if ! [[ "${{ inputs.TIMEOUT }}" =~ ^[0-9]+$ ]] || [ "${{ inputs.TIMEOUT }}" -lt 60 ]; then
+        echo "::error::Invalid timeout: ${{ inputs.TIMEOUT }}. Must be at least 60 seconds"
+        exit 1
+      fi
+    shell: bash
+
+  - name: Import Secrets From Vault
+    uses: hashicorp/vault-action@v2
+    with:
+      url: https://${{ inputs.VAULT_SERVER }}/
+      token: ${{ inputs.VAULT_TOKEN }}
+      tlsSkipVerify: true
+      secrets: |
+        ${{ inputs.VAULT_SECRETS_PATH }} NAMESPACE | NAMESPACE;
+        ${{ inputs.VAULT_SECRETS_PATH }} HTTP_HOST | HTTP_HOST;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_USER | CR_USER;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} GITHUB_PAT | GITHUB_PAT;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} CR_PASSWORD | CR_PASSWORD;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} IMAGE_REPOSITORY | IMAGE_REPOSITORY;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} DEV_KUBE_CONFIG | DEV_KUBE_CONFIG;
+        ${{ inputs.VAULT_SECRETS_PATH }} HELM_CHART_NAME | HELM_CHART_NAME;
+        ${{ inputs.VAULT_SECRETS_PATH }} HELM_CHART_VERSION | HELM_CHART_VERSION;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} TLS_CRT | TLS_CRT;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} TLS_KEY | TLS_KEY;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} AWS_ACCESS_KEY | AWS_ACCESS_KEY;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} AWS_SECRET_KEY | AWS_SECRET_KEY;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} ECR_REGION | ECR_REGION;
+        ${{ inputs.VAULT_SECRETS_CICD_PATH }} ECR_REPOSITORY | ECR_REPOSITORY;
+
+  - name: Setup Kubernetes Configuration
+    run: |
+      # Extract and secure kubeconfig
+      echo '${{ env.DEV_KUBE_CONFIG }}' > kubeconfig.yaml
+      export KUBECONFIG="${{ github.workspace }}/kubeconfig.yaml"
+      chmod 600 "$KUBECONFIG"
+      
+      # Verify kubeconfig
+      if ! kubectl cluster-info &>/dev/null; then
+        echo "::error::Failed to connect to Kubernetes cluster"
+        exit 1
+      fi
+    shell: bash
+
+  - name: Check Cluster Health
+    run: |
+      export KUBECONFIG="${{ github.workspace }}/kubeconfig.yaml"
+      
+      # Function to check cluster health with retries
+      check_cluster_health() {
+        local retries=${{ inputs.RETRY_COUNT }}
+        local delay=${{ inputs.RETRY_DELAY }}
+        
+        while [ $retries -gt 0 ]; do
+          if kubectl get --raw='/readyz?verbose' | grep -q "readyz check passed"; then
+            echo "Kubernetes cluster is healthy"
+            return 0
+          fi
+          
+          echo "Cluster health check failed. Retrying in $delay seconds..."
+          sleep $delay
+          retries=$((retries - 1))
+        done
+        
+        echo "::error::Cluster health check failed after ${{ inputs.RETRY_COUNT }} attempts"
+        return 1
+      }
+      
+      check_cluster_health
+    shell: bash
+
+  - name: Setup Namespace and Istio
+    run: |
+      export KUBECONFIG="${{ github.workspace }}/kubeconfig.yaml"
+      
+      # Create namespace if it doesn't exist
+      if ! kubectl get namespace "${{ env.NAMESPACE }}" &>/dev/null; then
+        echo "Creating namespace ${{ env.NAMESPACE }}"
+        kubectl create namespace "${{ env.NAMESPACE }}"
+      fi
+      
+      # Configure Istio if enabled
+      if [ "${{ inputs.ISTIO }}" = "true" ]; then
+        echo "Enabling Istio sidecar injection for namespace: ${{ env.NAMESPACE }}"
+        kubectl label namespace "${{ env.NAMESPACE }}" istio-injection=enabled --overwrite
+      fi
+    shell: bash
+
+  - name: Setup Container Registry Secret
+    run: |
+      export KUBECONFIG="${{ github.workspace }}/kubeconfig.yaml"
+      
+      # Create or update container registry secret
+      kubectl create secret docker-registry cr-secret \
+        --namespace="${{ env.NAMESPACE }}" \
+        --docker-server="${{ env.IMAGE_REPOSITORY }}" \
+        --docker-username="${{ env.CR_USER }}" \
+        --docker-password="${{ env.CR_PASSWORD }}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    shell: bash
+
+  - name: Setup AWS ECR Authentication
+    run: |
+      # Configure AWS credentials
+      export AWS_ACCESS_KEY_ID="${{ env.AWS_ACCESS_KEY }}"
+      export AWS_SECRET_ACCESS_KEY="${{ env.AWS_SECRET_KEY }}"
+      
+      # Login to ECR
+      aws ecr get-login-password --region "${{ env.ECR_REGION }}" | \
+        helm registry login --username AWS --password-stdin "${{ env.ECR_REPOSITORY }}"
+    shell: bash
+  
+  - name: Delete existing Helm 
+    run: | 
+      rm -rf "${{ env.HELM_CHART_NAME }}"
+    shell: bash
+
+  - name: Pull and Prepare Helm Chart
+    run: |
+      # Pull Helm chart
+      helm pull "oci://${{ env.ECR_REPOSITORY }}/${{ env.HELM_CHART_NAME }}" \
+        --version "${{ env.HELM_CHART_VERSION }}" \
+        --untar
+      
+      # Save TLS certificates
+      echo "${{ env.TLS_CRT }}" > "./${{ env.HELM_CHART_NAME }}/certs/tls.crt"
+      echo "${{ env.TLS_KEY }}" > "./${{ env.HELM_CHART_NAME }}/certs/tls.key"
+      
+      # Verify chart structure
+      if [ ! -f "./${{ env.HELM_CHART_NAME }}/Chart.yaml" ]; then
+        echo "::error::Invalid Helm chart structure"
+        exit 1
+      fi
+    shell: bash
+
+  - name: Deploy to Kubernetes
+    run: |
+      export KUBECONFIG="${{ github.workspace }}/kubeconfig.yaml"
+      
+      # Function to deploy with retries
+      deploy_with_retry() {
+        helm upgrade "${{ env.PROJECT_NAME }}" --install "./${{ env.HELM_CHART_NAME }}" \
+          --namespace="${{ env.NAMESPACE }}" \
+          --set replicaCount="${{ inputs.REPLICAS }}" \
+          --set nameOverride="${{ env.PROJECT_NAME }}" \
+          --set image.repository="${{ env.IMAGE_REPOSITORY }}/${{ github.repository }}-${{ inputs.ENVIRONMENT }}" \
+          --set image.tag="${{ inputs.IMAGE_TAG }}" \
+          --set ingress.host="${{ env.HTTP_HOST }}" \
+          ${{ inputs.EXTRA_HELM_ARGS_1 }} \
+          ${{ inputs.EXTRA_HELM_ARGS_2 }} \
+          ${{ inputs.EXTRA_HELM_ARGS_3 }}
+      }
+      
+      deploy_with_retry
+    shell: bash
+
+  - name: Cleanup
+    if: always()
+    run: |
+      # Cleanup sensitive files
+      rm -f "${{ github.workspace }}/kubeconfig.yaml"
+      rm -f "${{ github.workspace }}/${{ env.HELM_CHART_NAME }}/certs/tls.crt"
+      rm -f "${{ github.workspace }}/${{ env.HELM_CHART_NAME }}/certs/tls.key"
+      
+      # Cleanup AWS credentials
+      unset AWS_ACCESS_KEY_ID
+      unset AWS_SECRET_ACCESS_KEY
+    shell: bash

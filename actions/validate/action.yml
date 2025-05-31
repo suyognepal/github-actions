@@ -1,0 +1,25 @@
+name: Build Docker Image
+description: Build and Push Docker Image
+
+inputs:
+  DOCKERFILE:
+    description: 'Dockerfile name'
+    required: true
+    type: string
+    default: 'Dockerfile'
+  BUILD_CONTEXT:
+    description: 'Docker build context (e.g., .)'
+    required: true
+    type: string
+    default: '.'
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout repo
+      uses: actions/checkout@v3
+        
+    - name: Build, tag, and push docker image to Amazon ECR
+      run: |
+        docker build -t test:1 ${{ inputs.BUILD_CONTEXT }} --file ${{ inputs.DOCKERFILE }}
+      shell: bash
